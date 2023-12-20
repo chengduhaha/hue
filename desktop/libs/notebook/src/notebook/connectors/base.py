@@ -25,12 +25,12 @@ import uuid
 
 from django.utils.encoding import smart_str
 
-from beeswax.common import find_compute, is_compute
 from desktop.auth.backend import is_admin
 from desktop.conf import TASK_SERVER, has_connectors
 from desktop.lib import export_csvxls
 from desktop.lib.exceptions_renderable import PopupException
 from desktop.lib.i18n import smart_unicode
+from desktop.models import get_cluster_config
 from metadata.optimizer.base import get_api as get_optimizer_api
 
 from notebook.conf import get_ordered_interpreters
@@ -42,7 +42,7 @@ else:
   from django.utils.translation import ugettext as _
 
 
-LOG = logging.getLogger()
+LOG = logging.getLogger(__name__)
 
 
 class SessionExpired(Exception):
@@ -385,14 +385,6 @@ def get_interpreter(connector_type, user=None):
         'options': {},
         'is_sql': False
       }]
-    elif connector_type == 'custom':
-      interpreter = [{
-        'name': 'custom',
-        'type': 'custom',
-        'interface': '',
-        'options': {},
-        'is_sql': False
-      }]
     else:
       raise PopupException(_('Snippet type %s is not configured.') % connector_type)
   elif len(interpreter) > 1:
@@ -401,20 +393,14 @@ def get_interpreter(connector_type, user=None):
   return interpreter[0]
 
 
-def patch_snippet_for_connector(snippet, user=None):
+def patch_snippet_for_connector(snippet):
   """
   Connector backward compatibility switcher.
   # TODO Connector unification
   """
-  if is_compute(snippet):
-    snippet['connector'] = find_compute(cluster=snippet, user=user)
-    if snippet['connector'] and snippet['connector'].get('dialect'):
-      snippet['dialect'] = snippet['connector']['dialect']
-    return
   if snippet.get('connector') and snippet['connector'].get('type'):
-    if snippet['connector'].get('dialect') != 'hplsql':   # this is a workaround for hplsql describe not working
+    if snippet['connector']['dialect'] != 'hplsql':   # this is a workaround for hplsql describe not working
       snippet['type'] = snippet['connector']['type']  # To rename to 'id'
-  if snippet.get('connector') and snippet['connector'].get('dialect'):
     snippet['dialect'] = snippet['connector']['dialect']
   else:
     snippet['dialect'] = snippet['type']
@@ -429,30 +415,23 @@ def get_api(request, snippet):
   if snippet.get('type') == 'report':
     snippet['type'] = 'impala'
 
-  patch_snippet_for_connector(snippet, request.user)
+  patch_snippet_for_connector(snippet)
 
   connector_name = snippet['type']
 
-  interpreter = None
   if has_connectors() and snippet.get('type') == 'hello' and is_admin(request.user):
-    LOG.debug('Using the interpreter from snippet')
     interpreter = snippet.get('interpreter')
-  elif is_compute(snippet):
-    LOG.debug("Finding the compute from db using snippet: %s" % snippet)
-    interpreter = find_compute(cluster=snippet, user=request.user)
-  elif has_connectors() and snippet.get('connector'):
-    LOG.debug("Connectors are enabled and picking the connector from snippet['connector']")
-    interpreter = snippet['connector']
-  if not interpreter:
-    LOG.debug("Picking up the connectors from the configs using connector_name: %s" % connector_name)
+  else:
     interpreter = get_interpreter(connector_type=connector_name, user=request.user)
 
   interface = interpreter['interface']
 
-  # reconstruct 'custom' interpreter.
-  if snippet.get('type') and snippet.get('type') == 'custom': 
-    interface = snippet.get('interface') 
-    interpreter['options'] = snippet.get('options')
+  if get_cluster_config(request.user)['has_computes']:
+    compute = json.loads(request.POST.get('cluster', '""'))  # Via Catalog autocomplete API or Notebook create sessions.
+    if compute == '""' or compute == 'undefined':
+      compute = None
+    if not compute and snippet.get('compute'):  # Via notebook.ko.js
+      interpreter['compute'] = snippet['compute']
 
   LOG.debug('Selected interpreter %s interface=%s compute=%s' % (
     interpreter['type'],
@@ -493,6 +472,9 @@ def get_api(request, snippet):
     elif interpreter['options'] and interpreter['options'].get('url', '').find('vertica') >= 0:
       from notebook.connectors.jdbc_vertica import JdbcApiVertica
       return JdbcApiVertica(request.user, interpreter=interpreter)
+    elif interpreter['options'] and interpreter['options'].get('driver', '').find('kyuubi') >= 0:
+      from notebook.connectors.jdbc_kyuubi import JdbcApiKyuubi
+      return JdbcApiKyuubi(request.user, interpreter=interpreter)
     else:
       from notebook.connectors.jdbc import JdbcApi
       return JdbcApi(request.user, interpreter=interpreter)
@@ -617,7 +599,7 @@ class Api(object):
     query = response['statement']
 
     client = get_optimizer_api(self.user, interface)
-    patch_snippet_for_connector(snippet, self.user)
+    patch_snippet_for_connector(snippet)
 
     return client.query_risk(query=query, source_platform=snippet['dialect'], db_name=snippet.get('database') or 'default')
 
